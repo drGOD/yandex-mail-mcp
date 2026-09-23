@@ -16,7 +16,13 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.header import decode_header
-from email.utils import parsedate_to_datetime, getaddresses, formataddr
+from email.utils import (
+    parsedate_to_datetime,
+    getaddresses,
+    formataddr,
+    formatdate,
+    make_msgid,
+)
 import os
 import sys
 import logging
@@ -24,10 +30,10 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from imapclient import imap_utf7
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -124,14 +130,34 @@ logger = logging.getLogger(__name__)
 IMAP_SERVER = "imap.yandex.com"
 IMAP_PORT = 993
 SMTP_SERVER = "smtp.yandex.com"
+# Yandex documents implicit TLS on 465 as the primary submission port.
+# 587 + STARTTLS stays as a fallback when 465 cannot be opened.
+SMTP_SSL_PORT = 465
 SMTP_PORT = 587
 
-# Credentials from environment
+# Credentials from environment. App passwords are shown in space-separated
+# groups; those spaces are not part of the secret.
 EMAIL = os.getenv("YANDEX_EMAIL")
 PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
 
+
+def _normalize_app_password(password: Optional[str]) -> Optional[str]:
+    """Drop spaces from a Yandex app password. None stays None."""
+    if password is None:
+        return None
+    return password.replace(" ", "")
+
+
+PASSWORD = _normalize_app_password(PASSWORD)
+
+
+def _app_password() -> Optional[str]:
+    """Password actually sent to IMAP/SMTP, with display spaces removed."""
+    return _normalize_app_password(PASSWORD)
+
+
 # Create MCP server
-mcp = FastMCP("Yandex Mail")
+mcp = MCPServer("Yandex Mail", version=VERSION)
 
 
 def decode_mime_header(header_value: str) -> str:
@@ -188,12 +214,13 @@ def _connect_with_retry(factory, attempts: int = 3, backoff: float = 0.5):
 @contextmanager
 def imap_connection():
     """Context manager for IMAP connection (with transient-error retry)."""
-    if not EMAIL or not PASSWORD:
+    password = _app_password()
+    if not EMAIL or not password:
         raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
 
     conn = _connect_with_retry(lambda: imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT))
     try:
-        conn.login(EMAIL, PASSWORD)
+        conn.login(EMAIL, password)
         # Explicitly refresh capabilities after auth — some servers only
         # advertise extensions like MOVE, SPECIAL-USE or UIDPLUS after
         # successful LOGIN, and don't include them in the initial greeting
@@ -210,16 +237,52 @@ def imap_connection():
             pass
 
 
-@contextmanager
-def smtp_connection():
-    """Context manager for SMTP connection (with transient-error retry)."""
-    if not EMAIL or not PASSWORD:
-        raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
+def _open_smtp():
+    """
+    Open an SMTP session. Prefer implicit TLS on port 465.
 
-    conn = _connect_with_retry(lambda: smtplib.SMTP(SMTP_SERVER, SMTP_PORT))
+    If that connection fails, fall back to port 587 and STARTTLS.
+    Login is left to the caller so an authentication error does not
+    switch ports.
+    """
+    try:
+        return _connect_with_retry(
+            lambda: smtplib.SMTP_SSL(SMTP_SERVER, SMTP_SSL_PORT)
+        )
+    except (OSError, smtplib.SMTPException) as ssl_error:
+        logger.warning(
+            "SMTP_SSL %s:%s failed (%s); falling back to STARTTLS on port %s",
+            SMTP_SERVER,
+            SMTP_SSL_PORT,
+            ssl_error,
+            SMTP_PORT,
+        )
+
+    try:
+        conn = _connect_with_retry(lambda: smtplib.SMTP(SMTP_SERVER, SMTP_PORT))
+    except (OSError, smtplib.SMTPException) as fallback_error:
+        raise fallback_error from ssl_error
     try:
         conn.starttls()
-        conn.login(EMAIL, PASSWORD)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    return conn
+
+
+@contextmanager
+def smtp_connection():
+    """Context manager for SMTP connection (465 SSL, 587 STARTTLS fallback)."""
+    password = _app_password()
+    if not EMAIL or not password:
+        raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
+
+    conn = _open_smtp()
+    try:
+        conn.login(EMAIL, password)
         yield conn
     finally:
         try:
@@ -405,6 +468,77 @@ def _quote_folder_for_command(encoded: str) -> str:
     return f'"{escaped}"'
 
 
+_CRLF_RE = re.compile(r"[\r\n]")
+
+
+def _reject_header_injection(**fields: Optional[str]) -> None:
+    """Refuse CR/LF in header fields so values cannot inject extra headers."""
+    for name, value in fields.items():
+        if value is not None and _CRLF_RE.search(value):
+            raise ValueError(f"{name} must not contain CR or LF characters")
+
+
+def _address_pairs(value: Optional[str]) -> list[tuple[str, str]]:
+    """Parse an RFC 5322 address list. Empty addresses are dropped."""
+    if not value or not str(value).strip():
+        return []
+    pairs: list[tuple[str, str]] = []
+    for name, addr in getaddresses([str(value)]):
+        addr = (addr or "").strip()
+        if not addr:
+            continue
+        pairs.append((name or "", addr))
+    return pairs
+
+
+def _format_address_header(value: Optional[str]) -> Optional[str]:
+    """Rebuild a To/Cc header with formataddr (quotes names that contain commas)."""
+    pairs = _address_pairs(value)
+    if not pairs:
+        return None
+    return ", ".join(formataddr(pair) for pair in pairs)
+
+
+def _envelope_addresses(*values: Optional[str]) -> list[str]:
+    """Bare SMTP envelope addresses. Display names never go into RCPT TO."""
+    addresses: list[str] = []
+    for value in values:
+        for _name, addr in _address_pairs(value):
+            addresses.append(addr)
+    return addresses
+
+
+def _apply_address_headers(msg, to: str, cc: Optional[str] = None) -> None:
+    """Set To and Cc from parsed addresses. To must contain at least one."""
+    to_header = _format_address_header(to)
+    if not to_header:
+        raise ValueError("No recipients in To")
+    msg["To"] = to_header
+    cc_header = _format_address_header(cc)
+    if cc_header:
+        msg["Cc"] = cc_header
+
+
+def _stamp_message(msg) -> None:
+    """Set Date and Message-ID when the message does not already have them."""
+    if not msg.get("Date"):
+        msg["Date"] = formatdate(localtime=True)
+    if not msg.get("Message-ID"):
+        domain = None
+        if EMAIL and "@" in EMAIL:
+            domain = EMAIL.rsplit("@", 1)[1]
+        msg["Message-ID"] = make_msgid(domain=domain)
+
+
+def _smtp_send(msg, recipients: list[str]) -> None:
+    """Stamp the message and send it. Raises if SMTP fails; does not APPEND."""
+    if not recipients:
+        raise ValueError("No recipients")
+    _stamp_message(msg)
+    with smtp_connection() as conn:
+        conn.send_message(msg, EMAIL, recipients)
+
+
 def _build_message(
     to: str,
     subject: str,
@@ -455,16 +589,19 @@ def _build_message(
     else:
         msg = MIMEText(body, "plain", "utf-8")
 
+    _reject_header_injection(to=to, cc=cc, subject=subject)
     msg["Subject"] = subject
     msg["From"] = EMAIL
-    msg["To"] = to
-    if cc:
-        msg["Cc"] = cc
+    _apply_address_headers(msg, to, cc)
 
     if extra_headers:
         for name, value in extra_headers.items():
-            if value:
-                msg[name] = value
+            if not value:
+                continue
+            text = str(value)
+            if _CRLF_RE.search(text):
+                raise ValueError(f"{name} must not contain CR or LF characters")
+            msg[name] = text
 
     return msg, attached_names
 
@@ -1279,6 +1416,7 @@ def send_email(
     Returns confirmation with recipients, attached file names, and
     saved_to_sent (decoded Sent folder name or None).
     """
+    _reject_header_injection(to=to, cc=cc, bcc=bcc, subject=subject)
     msg, attached_names = _build_message(
         to=to,
         subject=subject,
@@ -1288,15 +1426,10 @@ def send_email(
         attachments=attachments,
     )
 
-    # Build recipient list for the SMTP envelope
-    recipients = [addr.strip() for addr in to.split(",")]
-    if cc:
-        recipients.extend([addr.strip() for addr in cc.split(",")])
-    if bcc:
-        recipients.extend([addr.strip() for addr in bcc.split(",")])
-
-    with smtp_connection() as conn:
-        conn.send_message(msg, EMAIL, recipients)
+    # Envelope is bare addresses only. A comma inside a display name must
+    # not become an extra RCPT TO.
+    recipients = _envelope_addresses(to, cc, bcc)
+    _smtp_send(msg, recipients)
 
     saved = None
     if save_to_sent:
@@ -1663,12 +1796,20 @@ def reply_email(
         raw = msg_data[0][1]
         original = email.message_from_bytes(raw)
 
-    original_msg_id = (original.get("Message-ID") or "").strip()
-    original_refs = (original.get("References") or "").strip()
-    original_subject = decode_mime_header(original.get("Subject", ""))
-    reply_to_header = original.get("Reply-To") or original.get("From") or ""
-    original_to = original.get("To", "")
-    original_cc = original.get("Cc", "")
+    original_msg_id = str(original.get("Message-ID") or "").strip()
+    original_refs = str(original.get("References") or "").strip()
+    original_subject = decode_mime_header(str(original.get("Subject") or ""))
+    reply_to_header = str(original.get("Reply-To") or original.get("From") or "")
+    original_to = str(original.get("To") or "")
+    original_cc = str(original.get("Cc") or "")
+    _reject_header_injection(
+        to=reply_to_header,
+        cc=original_cc,
+        subject=original_subject,
+        reply_to=reply_to_header,
+    )
+    if reply_all:
+        _reject_header_injection(to=original_to, cc=original_cc)
 
     # Reply recipients
     to_addr = reply_to_header
@@ -1711,7 +1852,7 @@ def reply_email(
     reply_subject = _dedupe_re_prefix(original_subject)
 
     msg, attached_names = _build_message(
-        to=to_addr,
+        to=reply_to_header,
         subject=reply_subject,
         body=body,
         cc=cc_addr,
@@ -1720,12 +1861,10 @@ def reply_email(
         extra_headers=extra_headers,
     )
 
-    recipients = [a.strip() for a in to_addr.split(",") if a.strip()]
-    if cc_addr:
-        recipients.extend(a.strip() for a in cc_addr.split(",") if a.strip())
-
-    with smtp_connection() as conn:
-        conn.send_message(msg, EMAIL, recipients)
+    # RCPT TO must be bare addresses. reply_to_header is the raw From/Reply-To
+    # value and may include a display name (including a comma inside the name).
+    recipients = _envelope_addresses(reply_to_header, cc_addr)
+    _smtp_send(msg, recipients)
 
     # Also mark the original as answered (best-effort; failure is non-fatal)
     try:
@@ -1843,9 +1982,8 @@ def forward_email(
 
         outer["Subject"] = forward_subject
         outer["From"] = EMAIL
-        outer["To"] = to
-        if cc:
-            outer["Cc"] = cc
+        _reject_header_injection(to=to, cc=cc, bcc=bcc, subject=forward_subject)
+        _apply_address_headers(outer, to, cc)
         msg = outer
     else:
         # Inline: build quoted body with original headers + text
@@ -1889,15 +2027,10 @@ def forward_email(
             attachments=attachments,
         )
 
-    # Recipients for SMTP envelope
-    recipients = [a.strip() for a in to.split(",") if a.strip()]
-    if cc:
-        recipients.extend(a.strip() for a in cc.split(",") if a.strip())
-    if bcc:
-        recipients.extend(a.strip() for a in bcc.split(",") if a.strip())
-
-    with smtp_connection() as conn:
-        conn.send_message(msg, EMAIL, recipients)
+    # Recipients for SMTP envelope — bare addresses, not raw header text.
+    _reject_header_injection(to=to, cc=cc, bcc=bcc, subject=forward_subject)
+    recipients = _envelope_addresses(to, cc, bcc)
+    _smtp_send(msg, recipients)
 
     saved = None
     if save_to_sent:

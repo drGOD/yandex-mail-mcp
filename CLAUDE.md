@@ -46,7 +46,7 @@ python -c "from yandex_mail_mcp import list_folders; print(list_folders())"
 
 ## Architecture
 
-Single-file MCP server (`yandex_mail_mcp.py`) using FastMCP framework. 28 `@mcp.tool()` functions + ~18 private helpers. The module is installed via the distribution name `yandex-mail-mcp` on PyPI.
+Single-file MCP server (`yandex_mail_mcp.py`) using `MCPServer` from `mcp.server.mcpserver` (MCP Python SDK 2.x). 28 `@mcp.tool()` functions + private helpers. The module is installed via the distribution name `yandex-mail-mcp` on PyPI.
 
 **Tool categories:**
 - **Read**: `list_folders`, `search_emails`, `read_email`, `download_attachment`, `get_folder_status`, `get_unread_summary`, `inspect_email`, `fetch_part`

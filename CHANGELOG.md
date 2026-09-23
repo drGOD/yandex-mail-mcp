@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-09-23
+
+SMTP send works on a fresh install of the MCP Python SDK 2.x.
+
+### Changed
+
+- Server uses `MCPServer` (`mcp.server.mcpserver`) and depends on `mcp>=2,<3`
+- Submission uses `SMTP_SSL` on port 465, with port 587 + STARTTLS as fallback
+- Envelope recipients are bare addresses from `email.utils.getaddresses`; To/Cc headers are built with `formataddr`
+- CR/LF in To, Cc, Bcc, and Subject is rejected
+- App-password spaces are stripped; outbound messages get Date and Message-ID
+- A successful send still APPENDs a copy to the `\Sent` folder and reports `saved_to_sent`
+
 ## [0.1.2] - 2026-04-11
 
 PyPI publication readiness. The core functionality is unchanged; this release
