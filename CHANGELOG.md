@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `Dockerfile` and `docker-compose.yml` to run the server over stdio. Credentials come from `.env` or the environment, not the image.
+
 ## [0.1.3] - 2026-09-23
 
 SMTP send works on a fresh install of the MCP Python SDK 2.x.

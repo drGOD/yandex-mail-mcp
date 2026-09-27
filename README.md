@@ -106,6 +106,48 @@ Then point Claude Desktop at the venv's Python:
 }
 ```
 
+## Docker
+
+The image installs this package and runs `yandex-mail-mcp` on stdio. It does not log in to Yandex until a tool is called. Copy the example env file and fill in your mailbox; do not commit `.env`.
+
+```bash
+cp .env.example .env
+# set YANDEX_EMAIL and YANDEX_APP_PASSWORD
+
+docker compose build
+docker compose run --rm -i -T yandex-mail-mcp
+```
+
+Required environment variables:
+
+- `YANDEX_EMAIL` — the Yandex mailbox address
+- `YANDEX_APP_PASSWORD` — the app password (spaces are fine; the server strips them)
+
+The same image without Compose:
+
+```bash
+docker build -t yandex-mail-mcp:local .
+docker run -i --rm \
+  -e YANDEX_EMAIL \
+  -e YANDEX_APP_PASSWORD \
+  yandex-mail-mcp:local
+```
+
+Cursor (or any other MCP client) should launch that process with stdin and stdout attached and without a TTY. From the project directory, after `docker compose build`:
+
+```json
+{
+  "mcpServers": {
+    "yandex-mail": {
+      "command": "docker",
+      "args": ["compose", "run", "--rm", "-i", "-T", "yandex-mail-mcp"]
+    }
+  }
+}
+```
+
+Compose reads `YANDEX_EMAIL` and `YANDEX_APP_PASSWORD` from the project `.env` (or the environment) and passes them into the container. They are not baked into the image.
+
 ## Configuration
 
 ### Credentials
