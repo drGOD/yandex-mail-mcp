@@ -1,0 +1,9 @@
+services:
+  yandex-mail-mcp:
+    build: .
+    image: yandex-mail-mcp:local
+    stdin_open: true
+    tty: false
+    environment:
+      YANDEX_EMAIL: ${YANDEX_EMAIL:?Set YANDEX_EMAIL in .env or the environment}
+      YANDEX_APP_PASSWORD: ${YANDEX_APP_PASSWORD:?Set YANDEX_APP_PASSWORD in .env or the environment}
